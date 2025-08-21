@@ -4,3 +4,4 @@ Flask-SQLAlchemy
 flask-login
 python-dotenv      # для .env-конфига
 python-telegram-bot
+aiohttp
