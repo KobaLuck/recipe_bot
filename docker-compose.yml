@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: recipes_bot
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - SITE_API_BASE=${SITE_API_BASE}
+      - API_PAGE_SIZE=${API_PAGE_SIZE}
+    volumes:
+      - ./bot_user_tokens.json:/app/bot_user_tokens.json
+      - ./instance:/app/instance
+    depends_on:
+      - app
+
+  app:
+    build: .
+    container_name: recipes_admin
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      - SECRET_KEY=${SECRET_KEY}
+      - DEBUG=${DEBUG}
+      - HOST=0.0.0.0
+      - PORT=5000
+      - ADMIN_IDS=${ADMIN_IDS}
+    volumes:
+      - ./instance:/app/instance
+    command: python app.py
+
+volumes:
+  instance:

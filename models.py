@@ -1,5 +1,5 @@
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime
+from datetime import datetime, timezone
 
 db = SQLAlchemy()
 
@@ -12,7 +12,10 @@ class User(db.Model):
     username = db.Column(db.String(64))
     first_name = db.Column(db.String(100))
     last_name = db.Column(db.String(100))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(
+        db.DateTime, 
+        default=lambda: datetime.now(timezone.utc)
+    )
 
     def __str__(self):
         return f"@{self.username or self.telegram_id}"
@@ -38,8 +41,9 @@ class Ingredient(db.Model):
 
     __table_args__ = (
         db.UniqueConstraint(
-            'name', 'measurement_unit', name='uq_ingredient_name_unit'
-            ),
+            'name', 'measurement_unit', 
+            name='uq_ingredient_name_unit'
+        ),
     )
 
     def __str__(self):
@@ -50,18 +54,26 @@ class RecipeIngredient(db.Model):
     __tablename__ = 'recipe_ingredient'
 
     id = db.Column(db.Integer, primary_key=True)
-    recipe_id = db.Column(db.Integer, db.ForeignKey(
-        'recipe.id', ondelete='CASCADE'), nullable=False)
-    ingredient_id = db.Column(db.Integer, db.ForeignKey(
-        'ingredient.id', ondelete='CASCADE'), nullable=False)
-    amount = db.Column(db.String(50), nullable=False)
+    recipe_id = db.Column(
+        db.Integer, 
+        db.ForeignKey('recipe.id', ondelete='CASCADE'), 
+        nullable=False
+    )
+    ingredient_id = db.Column(
+        db.Integer, 
+        db.ForeignKey('ingredient.id', ondelete='CASCADE'), 
+        nullable=False
+    )
+    amount = db.Column(db.Integer, nullable=False)
 
     recipe = db.relationship('Recipe', back_populates='recipe_ingredients')
     ingredient = db.relationship('Ingredient')
 
     __table_args__ = (
         db.UniqueConstraint(
-            'recipe_id', 'ingredient_id', name='uq_recipe_ingredient'),
+            'recipe_id', 'ingredient_id', 
+            name='uq_recipe_ingredient'
+        ),
     )
 
 
@@ -70,17 +82,24 @@ class TagInRecipe(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     tag_id = db.Column(
-        db.Integer, db.ForeignKey('tag.id', ondelete='CASCADE'),
-        nullable=False)
+        db.Integer, 
+        db.ForeignKey('tag.id', ondelete='CASCADE'),
+        nullable=False
+    )
     recipe_id = db.Column(
-        db.Integer, db.ForeignKey('recipe.id', ondelete='CASCADE'),
-        nullable=False)
+        db.Integer, 
+        db.ForeignKey('recipe.id', ondelete='CASCADE'),
+        nullable=False
+    )
 
     tag = db.relationship('Tag')
     recipe = db.relationship('Recipe', back_populates='tag_links')
 
     __table_args__ = (
-        db.UniqueConstraint('tag_id', 'recipe_id', name='uq_tag_in_recipe'),
+        db.UniqueConstraint(
+            'tag_id', 'recipe_id', 
+            name='uq_tag_in_recipe'
+        ),
     )
 
 
@@ -88,24 +107,39 @@ class Recipe(db.Model):
     __tablename__ = 'recipe'
 
     id = db.Column(db.Integer, primary_key=True)
-    author_id = db.Column(db.Integer,
-                          db.ForeignKey('user.id', ondelete='SET NULL'))
+    author_id = db.Column(
+        db.Integer,
+        db.ForeignKey('user.id', ondelete='SET NULL')
+    )
     name = db.Column(db.String(255), nullable=False)
     description = db.Column(db.Text, nullable=False)
     image_path = db.Column(db.String(255))
-    resource_url = db.Column(db.String(1000), default='https://avatars.mds.yandex.net/i?id=e8efae3f7d76a45b94612af5364cb135_l-4748118-images-thumbs&n=13')
+    resource_url = db.Column(
+        db.String(1000), 
+        default='https://avatars.mds.yandex.net/i?id=e8efae3f7d76a45b94612af5364cb135_l-4748118-images-thumbs&n=13'  # noqa: E501
+    )
     cooking_time = db.Column(db.Integer, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow,
-                           onupdate=datetime.utcnow)
+    created_at = db.Column(
+        db.DateTime, 
+        default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at = db.Column(
+        db.DateTime, 
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc)
+    )
 
     author = db.relationship('User', backref='recipes')
-    recipe_ingredients = db.relationship('RecipeIngredient',
-                                         back_populates='recipe',
-                                         cascade='all, delete-orphan')
-    tag_links = db.relationship('TagInRecipe',
-                                back_populates='recipe',
-                                cascade='all, delete-orphan')
+    recipe_ingredients = db.relationship(
+        'RecipeIngredient',
+        back_populates='recipe',
+        cascade='all, delete-orphan'
+    )
+    tag_links = db.relationship(
+        'TagInRecipe',
+        back_populates='recipe',
+        cascade='all, delete-orphan'
+    )
 
     def __str__(self):
         return self.name
@@ -115,19 +149,29 @@ class Favorite(db.Model):
     __tablename__ = 'favorite'
 
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer,
-                        db.ForeignKey('user.id', ondelete='CASCADE'),
-                        nullable=False)
-    recipe_id = db.Column(db.Integer,
-                          db.ForeignKey('recipe.id', ondelete='CASCADE'),
-                          nullable=False)
-    added_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id = db.Column(
+        db.Integer,
+        db.ForeignKey('user.id', ondelete='CASCADE'),
+        nullable=False
+    )
+    recipe_id = db.Column(
+        db.Integer,
+        db.ForeignKey('recipe.id', ondelete='CASCADE'),
+        nullable=False
+    )
+    added_at = db.Column(
+        db.DateTime, 
+        default=lambda: datetime.now(timezone.utc)
+    )
 
     user = db.relationship('User', backref='favorites')
     recipe = db.relationship('Recipe', backref='favorites')
 
     __table_args__ = (
-        db.UniqueConstraint('user_id', 'recipe_id', name='uq_user_favorite'),
+        db.UniqueConstraint(
+            'user_id', 'recipe_id', 
+            name='uq_user_favorite'
+        ),
     )
 
 
@@ -145,14 +189,20 @@ class ShoppingCart(db.Model):
         db.ForeignKey('recipe.id', ondelete='CASCADE'),
         nullable=False
     )
-    added_at = db.Column(db.DateTime, default=datetime.utcnow)
+    added_at = db.Column(
+        db.DateTime, 
+        default=lambda: datetime.now(timezone.utc)
+    )
 
     # Связи
     user = db.relationship('User', backref='shopping_carts')
     recipe = db.relationship('Recipe', backref='in_carts')
 
     __table_args__ = (
-        db.UniqueConstraint('user_id', 'recipe_id', name='uq_user_shopping_cart'),
+        db.UniqueConstraint(
+            'user_id', 'recipe_id', 
+            name='uq_user_shopping_cart'
+        ),
     )
 
     def __str__(self):
