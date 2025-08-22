@@ -294,7 +294,7 @@ tail -f bot.log
 
 ## 👥 Авторы
 
-- **Ваше имя** - *Начальная разработка* - [@your_username](https://github.com/your-username)
+- **Ваше имя** - *Начальная разработка* - [@KobaLuck](https://github.com/KobaLuck)
 
 ## 🙏 Благодарности
 
@@ -306,10 +306,8 @@ tail -f bot.log
 
 Если у вас есть вопросы или проблемы:
 
-- 📧 Email: your.email@example.com
-- 💬 Telegram: [@your_username](https://t.me/your_username)
-- 🐛 Issues: [GitHub Issues](https://github.com/your-username/recipes_book_bot/issues)
-- 📖 Wiki: [GitHub Wiki](https://github.com/your-username/recipes_book_bot/wiki)
+- 📧 Email: kazantsev.neckit@yandex.ru
+- 💬 Telegram: [@nickkoba](https://t.me/nickkoba)
 
 ---
 
