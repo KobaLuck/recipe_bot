@@ -1,35 +1,27 @@
-version: '3.8'
-
 services:
   bot:
     build: .
-    container_name: recipes_bot
     restart: unless-stopped
+    env_file: .env
     environment:
-      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - SITE_API_BASE=${SITE_API_BASE}
-      - API_PAGE_SIZE=${API_PAGE_SIZE}
+      TOKENS_FILE: /app/instance/bot_user_tokens.json
     volumes:
-      - ./bot_user_tokens.json:/app/bot_user_tokens.json
-      - ./instance:/app/instance
-    depends_on:
-      - app
+      - bot_data:/app/instance
 
+  # Optional legacy SQLite admin; start with --profile admin.
   app:
+    profiles: [admin]
     build: .
-    container_name: recipes_admin
     restart: unless-stopped
-    ports:
-      - "5000:5000"
+    env_file: .env
     environment:
-      - SECRET_KEY=${SECRET_KEY}
-      - DEBUG=${DEBUG}
-      - HOST=0.0.0.0
-      - PORT=5000
-      - ADMIN_IDS=${ADMIN_IDS}
+      HOST: 0.0.0.0
+      DEBUG: "False"
+    ports:
+      - "127.0.0.1:5000:5000"
     volumes:
-      - ./instance:/app/instance
+      - bot_data:/app/instance
     command: python app.py
 
 volumes:
-  instance:
+  bot_data:

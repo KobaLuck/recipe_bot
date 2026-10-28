@@ -1,723 +1,958 @@
-# bot.py
-import os
-import json
-import base64
-import threading
-import aiohttp
-import difflib
-from pathlib import Path
-from typing import Optional
+"""Telegram client for the Recipes API. No network or database work on import."""
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+import asyncio
+import base64
+import io
+import json
+import logging
+import os
+import tempfile
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+import aiohttp
+from dotenv import load_dotenv
+from telegram import InlineKeyboardButton as Button
+from telegram import InlineKeyboardMarkup as Markup
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
+    CommandHandler,
     ConversationHandler,
     MessageHandler,
+    TypeHandler,
     filters,
-    ContextTypes,
 )
 
-# FSM states
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+SITE_API_BASE = os.getenv("SITE_API_BASE", "").strip().rstrip("/")
+API_PAGE_SIZE = max(1, min(20, int(os.getenv("API_PAGE_SIZE") or "10")))
+TOKENS_FILE = Path(os.getenv("TOKENS_FILE", str(BASE_DIR / "instance" / "bot_user_tokens.json")))
+LOGGER = logging.getLogger(__name__)
 (
-    AUTH_CHOICE,        # выбор: login / register / anonymous (в start)
-    AUTH_LOGIN_EMAIL,
-    AUTH_LOGIN_PASS,
-    AUTH_REGISTER_EMAIL,
-    AUTH_REGISTER_USERNAME,
-    AUTH_REGISTER_FIRST,
-    AUTH_REGISTER_LAST,
-    AUTH_REGISTER_PASS,
-    RECIPE_NAME,
-    RECIPE_DESC,
+    AUTH_CHOICE,
+    LOGIN_EMAIL,
+    LOGIN_PASS,
+    REG_EMAIL,
+    REG_USERNAME,
+    REG_FIRST,
+    REG_LAST,
+    REG_PASS,
+    NAME,
+    DESCRIPTION,
     COOK_TIME,
-    ING_LETTER,         # выбрать букву
-    ING_PAGE,           # навигация страниц ингредиентов
-    ING_SELECT,         # выбрать конкретный ингредиент
+    ING_LETTER,
+    ING_PAGE,
     ING_QTY,
-    ING_CONFIRM_CHOOSE,  # добавить ещё или готово
-    TAGS_CHOOSE,        # выбрать теги (пагинация)
-    IMAGE_STEP,
-    URL_STEP,
-    CONFIRM_STEP,
-) = range(20)
-
-# Config from env
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SITE_API_BASE = os.getenv("SITE_API_BASE", "").rstrip("/") + "/"
-API_PAGE_SIZE = int(os.getenv("API_PAGE_SIZE", 10))
-TOKENS_FILE = Path("bot_user_tokens.json")
-
-if not TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в окружении")
-
-if not SITE_API_BASE:
-    raise RuntimeError("SITE_API_BASE не задан в окружении, пример: https://example.com/api/")
-
-# placeholder 1x1 transparent png (data-uri)
+    ING_MORE,
+    TAGS,
+    IMAGE,
+    URL,
+    CONFIRM,
+) = range(19)
+END = ConversationHandler.END
+# The site requires an image even when the user skips uploading one.
 PLACEHOLDER_PNG_DATAURI = (
     "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAAWgmWQ0AAAAASUVORK5CYII="
+    "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAe0lEQVR4nO3PQQ0AIBDAsPOvDxH8MYAIHg3Jkgno5uz1dcMFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjSgBQ1oQQNa0IAWNKAFDWhBA1rQgBY0oAUNaEEDWtCAFjx2AdXk8ndJ+FMbAAAAAElFTkSuQmCC"
 )
 
 
-# --------------------------
-# Маленький клиент API (aiohttp)
-# --------------------------
-async def api_request(method: str, path: str, token: Optional[str] = None,
-                      params: dict = None, json_data: dict = None, timeout=20):
-    url = SITE_API_BASE.rstrip("/") + "/" + path.lstrip("/")
-    headers = {}
-    if token:
-        headers["Authorization"] = f"Token {token}"
-    async with aiohttp.ClientSession() as sess:
-        func = getattr(sess, method.lower())
-        async with func(url, params=params, json=json_data, headers=headers, timeout=timeout) as resp:
-            text = await resp.text()
-            try:
-                data = await resp.json()
-            except Exception:
-                data = None
-            return resp.status, data or text
+def validate_config():
+    if not TOKEN or TOKEN == "your_telegram_bot_token_here":
+        raise RuntimeError("Укажите TELEGRAM_BOT_TOKEN в .env")
+    parsed = urlparse(SITE_API_BASE)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.netloc
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("Укажите SITE_API_BASE в .env, например https://example.com/api/")
 
 
-async def api_get(path: str, params: dict = None, token: Optional[str] = None):
-    return await api_request("get", path, token=token, params=params)
+def read_tokens():
+    if not TOKENS_FILE.exists():
+        return {}
+    data = json.loads(TOKENS_FILE.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Некорректный файл токенов")
+    return data
 
 
-async def api_post(path: str, json_data: dict = None, token: Optional[str] = None):
-    return await api_request("post", path, token=token, json_data=json_data)
+def write_tokens(data):
+    TOKENS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=TOKENS_FILE.parent, prefix=".tokens-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream)
+        os.replace(temporary, TOKENS_FILE)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
-# --------------------------
-# Токены пользователей (локальное хранилище)
-# --------------------------
-def save_token_local(telegram_id: int, token: str):
-    data = {}
-    if TOKENS_FILE.exists():
-        try:
-            data = json.loads(TOKENS_FILE.read_text(encoding="utf-8") or "{}")
-        except Exception:
-            data = {}
+def save_token_local(telegram_id, token):
+    data = read_tokens()
     data[str(telegram_id)] = token
-    TOKENS_FILE.write_text(json.dumps(data), encoding="utf-8")
+    write_tokens(data)
 
 
-def load_token_local(telegram_id: int) -> Optional[str]:
-    if not TOKENS_FILE.exists():
-        return None
-    try:
-        data = json.loads(TOKENS_FILE.read_text(encoding="utf-8") or "{}")
-    except Exception:
-        return None
-    return data.get(str(telegram_id))
+def load_token_local(telegram_id):
+    return read_tokens().get(str(telegram_id))
 
 
-def del_token_local(telegram_id: int):
-    if not TOKENS_FILE.exists():
-        return
-    try:
-        data = json.loads(TOKENS_FILE.read_text(encoding="utf-8") or "{}")
-    except Exception:
-        return
+def del_token_local(telegram_id):
+    data = read_tokens()
     data.pop(str(telegram_id), None)
-    TOKENS_FILE.write_text(json.dumps(data), encoding="utf-8")
+    write_tokens(data)
 
 
-# --------------------------
-# Helpers
-# --------------------------
-def format_api_errors(err_obj) -> str:
-    """
-    Ожидаем JSON ошибок от DRF: {field: [msg, ...], non_field_errors: [...]}
-    Выводим человеческое сообщение.
-    """
-    if not err_obj:
-        return "Неизвестная ошибка на сервере."
-    if isinstance(err_obj, dict):
-        parts = []
-        for k, v in err_obj.items():
-            if isinstance(v, (list, tuple)):
-                parts.append(f"{k}: {', '.join(str(x) for x in v)}")
-            else:
-                parts.append(f"{k}: {v}")
-        return "\n".join(parts) if parts else "Ошибка валидации."
-    if isinstance(err_obj, list):
-        return "\n".join(str(x) for x in err_obj)
-    return str(err_obj)
-
-
-async def download_photo_as_datauri(file_id: str, context: ContextTypes.DEFAULT_TYPE) -> str:
-    """
-    Скачивает файл Telegram по file_id и возвращает data-uri для загрузки в DRF Base64ImageField.
-    """
+async def api_request(method, path, token=None, params=None, json_data=None, timeout=20):
+    headers = {"Authorization": f"Token {token}"} if token else {}
     try:
-        f = await context.bot.get_file(file_id)
-        b = await f.download_as_bytearray()
-        # Попробуем угадать расширение:
-        ext = "jpeg"
-        if f.file_path and "." in f.file_path:
-            ext = f.file_path.rsplit(".", 1)[1]
-        b64 = base64.b64encode(bytes(b)).decode("ascii")
-        return f"data:image/{ext};base64,{b64}"
-    except Exception:
-        # Если не удалось — вернуть placeholder
-        return PLACEHOLDER_PNG_DATAURI
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.request(
+                method,
+                f"{SITE_API_BASE}/{path.lstrip('/')}",
+                params=params,
+                json=json_data,
+                headers=headers,
+                allow_redirects=False,
+            ) as response:
+                try:
+                    data = await response.json(content_type=None)
+                except (ValueError, UnicodeError):
+                    # Do not show HTML tracebacks or proxy diagnostics to users.
+                    data = (
+                        {"detail": "Сервер вернул некорректный ответ."}
+                        if response.status != 204
+                        else None
+                    )
+                return response.status, data
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return 503, {"detail": "Сайт временно недоступен. Попробуйте ещё раз."}
 
 
-# --------------------------
-# Start / Auth flow
-# --------------------------
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Приветственное сообщение и выбор: Войти / Зарегистрироваться / Аноним
-    """
-    user = update.effective_user
-    text = (
-        f"Привет, {user.first_name or user.username or 'друг'}!\n\n"
-        "Я — бот для создания рецептов на сайте. Выберите, как вы хотите продолжить:\n\n"
-        "• Войти (email + пароль)\n"
-        "• Зарегистрироваться\n"
-        "• Продолжить как аноним (только просмотр / добавление в корзину без создания рецептов от имени пользователя)\n\n"
-        "Если войдёте — рецепты будут создаваться под вашим аккаунтом на сайте."
-    )
-    kb = [
-        [InlineKeyboardButton("Войти", callback_data="auth:login")],
-        [InlineKeyboardButton("Регистрация", callback_data="auth:register")],
-        [InlineKeyboardButton("Аноним", callback_data="auth:anon")],
-    ]
-    await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    return AUTH_CHOICE
+async def api_get(path, params=None, token=None):
+    return await api_request("GET", path, token=token, params=params)
 
 
-async def auth_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    action = q.data.split(":", 1)[1]
-    if action == "login":
-        await q.message.reply_text("Введите email для входа:")
-        return AUTH_LOGIN_EMAIL
-    if action == "register":
-        await q.message.reply_text("Регистрация — введите email:")
-        return AUTH_REGISTER_EMAIL
-    if action == "anon":
-        # убираем токен, если был
-        del_token_local(q.from_user.id)
-        await q.message.reply_text("Вы продолжаете как аноним. Некоторые операции (создание рецептов от вашего аккаунта) будут недоступны.")
-        return ConversationHandler.END
-    await q.message.reply_text("Неизвестный выбор.")
-    return ConversationHandler.END
+async def api_post(path, json_data=None, token=None):
+    return await api_request("POST", path, token=token, json_data=json_data)
 
 
-# Login flow
-async def auth_login_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["auth_email"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text("Введите пароль:")
-    return AUTH_LOGIN_PASS
+def format_api_errors(data):
+    if isinstance(data, dict):
+        return "\n".join(f"{key}: {format_api_errors(value)}" for key, value in data.items())[:2000]
+    if isinstance(data, list):
+        return "; ".join(map(str, data))[:2000]
+    return str(data or "Неизвестная ошибка сервера.")[:2000]
 
 
-async def auth_login_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    email = context.user_data.pop("auth_email", None)
-    password = update.effective_message.text.strip()
-    # Djoser token login endpoint: POST /api/auth/token/login/ {email, password}
-    payload = {"email": email, "password": password}
-    status, data = await api_post("auth/token/login/", json_data=payload)
-    if status in (200, 201) and isinstance(data, dict) and data.get("auth_token"):
-        token = data["auth_token"]
-        save_token_local(update.effective_user.id, token)
-        await update.effective_message.reply_text("Успешно выполнен вход. Токен сохранён локально.")
-        return ConversationHandler.END
-    # error
-    msg = format_api_errors(data)
-    await update.effective_message.reply_text(f"Ошибка входа: {msg}")
-    return AUTH_LOGIN_EMAIL
+def keyboard(rows=(), cancel=True):
+    rows = list(rows)
+    if cancel:
+        rows.append([Button("❌ Отмена", callback_data="cancel")])
+    return Markup(rows)
 
 
-# Register flow (collect fields)
-async def auth_register_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["reg_email"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text("Введите желаемый username:")
-    return AUTH_REGISTER_USERNAME
+async def say(update, text, rows=(), cancel=True):
+    """Use effective_message for both text updates and button callbacks."""
+    await update.effective_message.reply_text(text, reply_markup=keyboard(rows, cancel))
 
 
-async def auth_register_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["reg_username"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text("Имя (first_name):")
-    return AUTH_REGISTER_FIRST
+async def answer(update):
+    if update.callback_query:
+        await update.callback_query.answer()
 
 
-async def auth_register_first(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["reg_first"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text("Фамилия (last_name):")
-    return AUTH_REGISTER_LAST
+async def send_long(message, text, reply_markup=None):
+    for start in range(0, len(text), 4000):
+        last = start + 4000 >= len(text)
+        await message.reply_text(
+            text[start : start + 4000], reply_markup=reply_markup if last else None
+        )
 
 
-async def auth_register_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["reg_last"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text("Пароль:")
-    return AUTH_REGISTER_PASS
+async def private_only(update, context):
+    if update.effective_chat and update.effective_chat.type != "private":
+        await answer(update)
+        raise ApplicationHandlerStop
 
 
-async def auth_register_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Submitting registration to /api/auth/users/
-    email = context.user_data.pop("reg_email", None)
-    username = context.user_data.pop("reg_username", None)
-    first = context.user_data.pop("reg_first", "")
-    last = context.user_data.pop("reg_last", "")
-    password = update.effective_message.text.strip()
-    payload = {
-        "email": email,
-        "username": username,
-        "first_name": first,
-        "last_name": last,
-        "password": password,
-    }
-    status, data = await api_post("auth/users/", json_data=payload)
-    if status in (200, 201):
-        # user created; Djoser commonly returns user data. Now auto-login (token)
-        # token login:
-        status2, data2 = await api_post("auth/token/login/", json_data={"email": email, "password": password})
-        if status2 in (200, 201) and isinstance(data2, dict) and data2.get("auth_token"):
-            save_token_local(update.effective_user.id, data2["auth_token"])
-            await update.effective_message.reply_text("Регистрация и вход успешно выполнены.")
-            return ConversationHandler.END
-        await update.effective_message.reply_text("Регистрация выполнена, но автологин не удался. Попробуйте войти вручную.")
-        return ConversationHandler.END
-    # errors
-    await update.effective_message.reply_text("Ошибка регистрации: " + format_api_errors(data))
-    return AUTH_REGISTER_EMAIL
-
-
-# --------------------------
-# Рецепт: создание с выбором ингредиентов по букве + пагинация, выбор тегов (существующих)
-# --------------------------
-
-async def start_add_recipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Запуск создания рецепта (entry point). Проверим, есть ли токен у пользователя.
-    """
-    q = update.callback_query
-    if q:
-        await q.answer()
-        # allow anonymous to create? We'll allow but server will reject if token required to create
+async def menu(update, context):
+    await answer(update)
     context.user_data.clear()
-    await (q.message if q else update.effective_message).reply_text(
-        "Создание рецепта — введите название:"
+    rows = [
+        [Button("📋 Рецепты", callback_data="list:all:1")],
+        [Button("➕ Создать рецепт", callback_data="add_recipe")],
+        [
+            Button("⭐ Избранное", callback_data="list:fav:1"),
+            Button("🛒 Корзина", callback_data="list:cart:1"),
+        ],
+        [Button("🧾 Список покупок", callback_data="shopping_list")],
+        [
+            Button("Войти", callback_data="auth:login"),
+            Button("Регистрация", callback_data="auth:register"),
+        ],
+        [Button("Выйти", callback_data="logout")],
+    ]
+    await say(
+        update, "Выберите действие. Для отмены любого шага используйте /cancel.", rows, cancel=False
     )
-    return RECIPE_NAME
+    return END
 
 
-async def recipe_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["name"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text("Введите короткое описание (text) рецепта:")
-    return RECIPE_DESC
+async def start_handler(update, context):
+    return await menu(update, context)
 
 
-async def recipe_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["description"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text("Укажите время приготовления в минутах (целое число):")
-    return COOK_TIME
+async def auth_choice_handler(update, context):
+    await answer(update)
+    context.user_data.clear()
+    action = update.callback_query.data.split(":")[1]
+    if action == "login":
+        await say(update, "Введите email для входа:")
+        return LOGIN_EMAIL
+    await say(update, "Регистрация — введите email:")
+    return REG_EMAIL
 
 
-async def recipe_cook_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.effective_message.text.strip()
-    if not txt.isdigit() or int(txt) < 1:
-        await update.effective_message.reply_text("Время должно быть целым числом ≥ 1. Введите ещё раз:")
-        return COOK_TIME
-    context.user_data["cooking_time"] = int(txt)
-    context.user_data["ingredients"] = []
-    # предложим выбрать первую букву
-    kb = []
-    # А–Я + A–Z (упрощённо): создадим буквы латинские и кириллические
-    # Для компактности дадим «А-Я» кнопки: будем отправлять английский алфавит + цифры 0-9
-    letters = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + list("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ")
-    row = []
-    for i, ch in enumerate(letters):
-        row.append(InlineKeyboardButton(ch, callback_data=f"ing_letter:{ch}"))
-        if (i + 1) % 6 == 0:
-            kb.append(row); row = []
-    if row:
-        kb.append(row)
-    kb.append([InlineKeyboardButton("Готово (перейти к тегам)", callback_data="ing_done")])
-    await update.effective_message.reply_text(
-        "Выберите первую букву ингредиента (покажем ингредиенты, начинающиеся на неё).",
-        reply_markup=InlineKeyboardMarkup(kb),
+async def collect_text(update, context, key, prompt, current_state, next_state, limit=150):
+    value = update.effective_message.text.strip()
+    if not value or len(value) > limit:
+        await say(update, f"Введите от 1 до {limit} символов:")
+        return current_state
+    context.user_data[key] = value
+    await say(update, prompt)
+    return next_state
+
+
+async def auth_login_email(update, context):
+    return await collect_text(
+        update, context, "email", "Введите пароль:", LOGIN_EMAIL, LOGIN_PASS, 254
     )
+
+
+async def delete_password_message(update):
+    try:
+        await update.effective_message.delete()
+    except Exception:
+        # Telegram may refuse deletion; never log or persist the password.
+        pass
+
+
+async def auth_login_pass(update, context):
+    password = update.effective_message.text  # Spaces may be part of a password.
+    await delete_password_message(update)
+    status, data = await api_post(
+        "auth/token/login/", {"email": context.user_data.get("email"), "password": password}
+    )
+    if status == 200 and isinstance(data, dict) and data.get("auth_token"):
+        save_token_local(update.effective_user.id, data["auth_token"])
+        await say(update, "Вход выполнен.", cancel=False)
+        return await menu(update, context)
+    context.user_data.clear()
+    await say(update, "Ошибка входа: " + format_api_errors(data) + "\nВведите email заново:")
+    return LOGIN_EMAIL
+
+
+async def auth_register_email(update, context):
+    return await collect_text(
+        update, context, "email", "Введите username:", REG_EMAIL, REG_USERNAME, 254
+    )
+
+
+async def auth_register_username(update, context):
+    return await collect_text(update, context, "username", "Введите имя:", REG_USERNAME, REG_FIRST)
+
+
+async def auth_register_first(update, context):
+    return await collect_text(
+        update, context, "first_name", "Введите фамилию:", REG_FIRST, REG_LAST
+    )
+
+
+async def auth_register_last(update, context):
+    return await collect_text(update, context, "last_name", "Введите пароль:", REG_LAST, REG_PASS)
+
+
+async def auth_register_pass(update, context):
+    password = update.effective_message.text
+    await delete_password_message(update)
+    payload = {
+        key: context.user_data[key] for key in ("email", "username", "first_name", "last_name")
+    }
+    payload["password"] = password
+    status, data = await api_post("users/", payload)
+    context.user_data.clear()
+    if status not in (200, 201):
+        await say(
+            update, "Ошибка регистрации: " + format_api_errors(data) + "\nВведите email заново:"
+        )
+        return REG_EMAIL
+    status, data = await api_post(
+        "auth/token/login/", {"email": payload["email"], "password": password}
+    )
+    if status == 200 and isinstance(data, dict) and data.get("auth_token"):
+        save_token_local(update.effective_user.id, data["auth_token"])
+        await say(update, "Регистрация и вход выполнены.", cancel=False)
+    else:
+        await say(update, "Регистрация выполнена. Для входа выберите «Войти».", cancel=False)
+    return await menu(update, context)
+
+
+async def logout(update, context):
+    await answer(update)
+    token = load_token_local(update.effective_user.id)
+    if token:
+        status, data = await api_post("auth/token/logout/", token=token)
+        if status not in (200, 204, 401):
+            await say(
+                update,
+                "Не удалось завершить сеанс на сайте: " + format_api_errors(data),
+                cancel=False,
+            )
+            return END
+    del_token_local(update.effective_user.id)
+    await say(update, "Вы вышли из аккаунта.", cancel=False)
+    return await menu(update, context)
+
+
+async def start_add_recipe(update, context):
+    await answer(update)
+    context.user_data.clear()
+    if not load_token_local(update.effective_user.id):
+        await say(update, "Сначала войдите в аккаунт: /start → Войти.", cancel=False)
+        return END
+    await say(update, "Введите название рецепта:")
+    return NAME
+
+
+async def recipe_name(update, context):
+    return await collect_text(
+        update, context, "name", "Введите описание рецепта:", NAME, DESCRIPTION, 100
+    )
+
+
+async def recipe_desc(update, context):
+    return await collect_text(
+        update,
+        context,
+        "description",
+        "Время приготовления в минутах (целое ≥ 1):",
+        DESCRIPTION,
+        COOK_TIME,
+        2000,
+    )
+
+
+def positive_integer(text):
+    try:
+        value = int(text)
+        return value if 1 <= value <= 2147483647 else None
+    except ValueError:
+        return None
+
+
+async def show_letters(update):
+    letters = list("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    rows = [
+        [Button(ch, callback_data=f"ing_letter:{ch}") for ch in letters[i : i + 6]]
+        for i in range(0, len(letters), 6)
+    ]
+    rows.append([Button("✅ Готово — к тегам", callback_data="ing_done")])
+    await say(update, "Выберите первую букву или напишите часть названия ингредиента:", rows)
     return ING_LETTER
 
 
-async def ing_letter_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    letter = q.data.split(":", 1)[1]
-    context.user_data.setdefault("ing_browser", {})["letter"] = letter
-    # получаем первую страницу
-    status, data = await api_get("ingredients/", params={"name": letter, "page": 1})
+async def recipe_cook_time(update, context):
+    value = positive_integer(update.effective_message.text)
+    if value is None:
+        await say(update, "Введите целое число от 1 до 2147483647:")
+        return COOK_TIME
+    context.user_data["cooking_time"] = value
+    context.user_data["ingredients"] = []
+    return await show_letters(update)
+
+
+async def catalog(path, page, params=None):
+    """Support DRF paginated responses and unpaginated catalogues from Recipes."""
+    status, data = await api_get(
+        path, params={**(params or {}), "page": page, "limit": API_PAGE_SIZE}
+    )
     if status != 200:
-        await q.message.reply_text("Ошибка получения ингредиентов: " + format_api_errors(data))
+        return status, data
+    if isinstance(data, list):
+        start = (page - 1) * API_PAGE_SIZE
+        return 200, {
+            "results": data[start : start + API_PAGE_SIZE],
+            "previous": page > 1,
+            "next": start + API_PAGE_SIZE < len(data),
+        }
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        return status, data
+    return 502, {"detail": "Неверный формат каталога."}
+
+
+async def show_ingredients(update, context, search, page=1):
+    status, data = await catalog("ingredients/", page, {"name": search})
+    if status != 200:
+        await say(update, "Ошибка получения ингредиентов: " + format_api_errors(data))
         return ING_LETTER
-    context.user_data["ing_browser"]["page"] = 1
-    await show_ingredient_page(q.message, data, letter, 1)
-    return ING_PAGE
-
-
-async def show_ingredient_page(message, resp_json, letter, page):
-    """
-    Ожидаем стандартную DRF pagination: {'count', 'next', 'previous', 'results': [...]}
-    Если нет пагинации — resp_json может быть list.
-    """
-    results = resp_json.get("results") if isinstance(resp_json, dict) else resp_json
-    buttons = []
-    for item in results:
-        # item expected: {'id', 'name', 'measurement_unit'}
-        buttons.append([InlineKeyboardButton(f"{item['name']} ({item.get('measurement_unit','')})", callback_data=f"ing_select:{item['id']}")])
-    # navigation
+    context.user_data["ing_search"] = search
+    context.user_data["ing_page"] = page
+    context.user_data["ing_options"] = {item["id"]: item for item in data["results"]}
+    rows = [
+        [
+            Button(
+                f"{item['name']} ({item['measurement_unit']})",
+                callback_data=f"ing_select:{item['id']}",
+            )
+        ]
+        for item in data["results"]
+    ]
     nav = []
-    if isinstance(resp_json, dict) and resp_json.get("previous"):
-        nav.append(InlineKeyboardButton("‹ Prev", callback_data=f"ing_page:{letter}:{page-1}"))
-    if isinstance(resp_json, dict) and resp_json.get("next"):
-        nav.append(InlineKeyboardButton("Next ›", callback_data=f"ing_page:{letter}:{page+1}"))
+    if data.get("previous"):
+        nav.append(Button("‹ Назад", callback_data=f"ing_page:{page - 1}"))
+    if data.get("next"):
+        nav.append(Button("Далее ›", callback_data=f"ing_page:{page + 1}"))
     if nav:
-        buttons.append(nav)
-    buttons.append([InlineKeyboardButton("Назад к буквам", callback_data="ing_back_letters")])
-    await message.reply_text("Выберите ингредиент:", reply_markup=InlineKeyboardMarkup(buttons))
-
-
-async def ing_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, letter, page_s = q.data.split(":", 2)
-    page = int(page_s)
-    status, data = await api_get("ingredients/", params={"name": letter, "page": page})
-    if status != 200:
-        await q.message.reply_text("Ошибка получения ингредиентов: " + format_api_errors(data))
-        return ING_LETTER
-    context.user_data["ing_browser"]["page"] = page
-    await show_ingredient_page(q.message, data, letter, page)
+        rows.append(nav)
+    rows += [
+        [Button("Другой ингредиент", callback_data="ing_back_letters")],
+        [Button("✅ Готово — к тегам", callback_data="ing_done")],
+    ]
+    await say(
+        update,
+        "Выберите ингредиент:"
+        if data["results"]
+        else "Ничего не найдено. Попробуйте другое название.",
+        rows,
+    )
     return ING_PAGE
 
 
-async def ing_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, ing_id = q.data.split(":", 1)
-    context.user_data["selected_ing"] = int(ing_id)
-    await q.message.reply_text("Введите количество (целое ≥ 1):")
+async def ing_letter_handler(update, context):
+    await answer(update)
+    search = (
+        update.callback_query.data.split(":", 1)[1]
+        if update.callback_query
+        else update.effective_message.text.strip()
+    )
+    if not search or len(search) > 100:
+        return await show_letters(update)
+    return await show_ingredients(update, context, search)
+
+
+async def ing_page_handler(update, context):
+    await answer(update)
+    return await show_ingredients(
+        update,
+        context,
+        context.user_data.get("ing_search", ""),
+        int(update.callback_query.data.split(":")[1]),
+    )
+
+
+async def ing_select_handler(update, context):
+    await answer(update)
+    ing_id = int(update.callback_query.data.split(":")[1])
+    item = context.user_data.get("ing_options", {}).get(ing_id)
+    if not item:
+        return await show_letters(update)
+    if any(ing["id"] == ing_id for ing in context.user_data["ingredients"]):
+        await say(update, "Этот ингредиент уже добавлен. Выберите другой.")
+        return await show_letters(update)
+    context.user_data["selected_ing"] = item
+    await say(update, f"Количество для «{item['name']}» ({item['measurement_unit']}), целое ≥ 1:")
     return ING_QTY
 
 
-async def ing_qty_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.effective_message.text.strip()
-    if not txt.isdigit() or int(txt) < 1:
-        await update.effective_message.reply_text("Количество должно быть целым числом ≥ 1. Введите ещё раз:")
+async def ing_qty_handler(update, context):
+    value = positive_integer(update.effective_message.text)
+    if value is None:
+        await say(update, "Введите целое количество от 1 до 2147483647:")
         return ING_QTY
-    ing_id = context.user_data.pop("selected_ing")
-    context.user_data.setdefault("ingredients", []).append({"id": ing_id, "amount": int(txt)})
-    kb = [
-        [InlineKeyboardButton("Добавить ещё (выбрать букву)", callback_data="ing_back_letters")],
-        [InlineKeyboardButton("Готово — перейти к тегам", callback_data="ing_done")],
-    ]
-    await update.effective_message.reply_text("Ингредиент добавлен.", reply_markup=InlineKeyboardMarkup(kb))
-    return ING_CONFIRM_CHOOSE
+    item = context.user_data.pop("selected_ing")
+    context.user_data["ingredients"].append({**item, "amount": value})
+    await say(
+        update,
+        f"Добавлено: {item['name']} — {value} {item['measurement_unit']}.\nВыберите следующий ингредиент или нажмите «Готово».",
+        [
+            [Button("Следующий ингредиент", callback_data="ing_back_letters")],
+            [Button("✅ Готово — к тегам", callback_data="ing_done")],
+        ],
+    )
+    return ING_MORE
 
 
-async def ing_confirm_choose_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "ing_back_letters":
-        # показать буквы заново
-        # reuse recipe_cook_time's letters UI generation
-        letters = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + list("АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ")
-        kb = []
-        row = []
-        for i, ch in enumerate(letters):
-            row.append(InlineKeyboardButton(ch, callback_data=f"ing_letter:{ch}"))
-            if (i + 1) % 6 == 0:
-                kb.append(row); row = []
-        if row:
-            kb.append(row)
-        kb.append([InlineKeyboardButton("Готово (перейти к тегам)", callback_data="ing_done")])
-        await q.message.reply_text("Выберите букву:", reply_markup=InlineKeyboardMarkup(kb))
-        return ING_LETTER
-    if q.data == "ing_done":
-        # proceed to tags selection
-        return await tags_start(q.message, context)
+async def ing_confirm_choose_handler(update, context):
+    await answer(update)
+    if update.callback_query.data == "ing_back_letters":
+        return await show_letters(update)
+    if not context.user_data.get("ingredients"):
+        await say(update, "Добавьте хотя бы один ингредиент.")
+        return await show_letters(update)
+    return await show_tags(update, context)
 
 
-# Tags selection: we'll fetch tags from API and present (pagination if necessary)
-async def tags_start(message, context: ContextTypes.DEFAULT_TYPE):
-    status, data = await api_get("tags/", params={"page": 1})
+async def show_tags(update, context, page=1):
+    status, data = await catalog("tags/", page)
     if status != 200:
-        await message.reply_text("Ошибка получения тегов: " + format_api_errors(data))
-        return TAGS_CHOOSE
-    context.user_data["tags_browser"] = {"page": 1}
-    await show_tags_page(message, data, 1)
-    return TAGS_CHOOSE
-
-
-async def show_tags_page(message, resp_json, page):
-    results = resp_json.get("results") if isinstance(resp_json, dict) else resp_json
-    buttons = []
-    for t in results:
-        buttons.append([InlineKeyboardButton(t["name"], callback_data=f"tag_select:{t['id']}")])
+        await say(
+            update,
+            "Ошибка получения тегов: " + format_api_errors(data),
+            [[Button("Повторить", callback_data="tag_page:1")]],
+        )
+        return TAGS
+    context.user_data["tag_page"] = page
+    context.user_data["tag_options"] = {item["id"]: item["name"] for item in data["results"]}
+    chosen = context.user_data.setdefault("selected_tags", {})
+    rows = [
+        [
+            Button(
+                ("✅ " if item["id"] in chosen else "") + item["name"],
+                callback_data=f"tag_select:{item['id']}",
+            )
+        ]
+        for item in data["results"]
+    ]
     nav = []
-    if isinstance(resp_json, dict) and resp_json.get("previous"):
-        nav.append(InlineKeyboardButton("‹ Prev", callback_data=f"tag_page:{page-1}"))
-    if isinstance(resp_json, dict) and resp_json.get("next"):
-        nav.append(InlineKeyboardButton("Next ›", callback_data=f"tag_page:{page+1}"))
+    if data.get("previous"):
+        nav.append(Button("‹ Назад", callback_data=f"tag_page:{page - 1}"))
+    if data.get("next"):
+        nav.append(Button("Далее ›", callback_data=f"tag_page:{page + 1}"))
     if nav:
-        buttons.append(nav)
-    buttons.append([InlineKeyboardButton("Готово (далее фото)", callback_data="tags_done")])
-    await message.reply_text("Выберите теги (можно несколько):", reply_markup=InlineKeyboardMarkup(buttons))
-
-
-async def tag_page_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, page_s = q.data.split(":", 1)
-    page = int(page_s)
-    status, data = await api_get("tags/", params={"page": page})
-    if status != 200:
-        await q.message.reply_text("Ошибка получения тегов: " + format_api_errors(data))
-        return TAGS_CHOOSE
-    context.user_data["tags_browser"]["page"] = page
-    await show_tags_page(q.message, data, page)
-    return TAGS_CHOOSE
-
-
-async def tag_select_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, tag_id_s = q.data.split(":", 1)
-    tag_id = int(tag_id_s)
-    sel = context.user_data.setdefault("selected_tags", set())
-    if tag_id in sel:
-        sel.remove(tag_id)
-        await q.message.reply_text("Тег убран из выбора.")
-    else:
-        sel.add(tag_id)
-        await q.message.reply_text("Тег добавлен.")
-    # stay on TAGS_CHOOSE (user can finish with tags_done)
-    return TAGS_CHOOSE
-
-
-async def tags_done_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    # Ensure at least one tag (site requires it)
-    tags = list(context.user_data.get("selected_tags", []))
-    if not tags:
-        await q.message.reply_text("Нужно выбрать хотя бы один тег. Пожалуйста, выберите тег.")
-        return TAGS_CHOOSE
-    context.user_data["tags"] = tags
-    await q.message.reply_text("Пришлите фото рецепта (или нажмите Пропустить):",
-                               reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Пропустить", callback_data="skip_image")]]))
-    return IMAGE_STEP
-
-
-# IMAGE step: receive photo or skip
-async def image_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        if update.callback_query.data == "skip_image":
-            context.user_data["image_datauri"] = None
-        else:
-            context.user_data["image_datauri"] = None
-    else:
-        # user sent a photo
-        photo = update.effective_message.photo
-        if not photo:
-            await update.effective_message.reply_text("Ожидалось фото. Повторите или нажмите Пропустить.")
-            return IMAGE_STEP
-        file_id = photo[-1].file_id
-        # сохраним file_id для обработки позже
-        context.user_data["image_file_id"] = file_id
-    await update.effective_message.reply_text("Добавьте ссылку на источник (или нажмите Пропустить):",
-                                              reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Пропустить", callback_data="skip_url")]]))
-    return URL_STEP
-
-
-async def url_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        if update.callback_query.data == "skip_url":
-            context.user_data["source_url"] = None
-        else:
-            context.user_data["source_url"] = None
-    else:
-        context.user_data["source_url"] = update.effective_message.text.strip()
-
-    # подготовим сводку и кнопки подтверждения / редактирования
-    data = context.user_data
-    ing_text = "\n".join(f"- id:{i['id']} × {i['amount']}" for i in data.get("ingredients", []))
-    tags_text = ", ".join(str(t) for t in data.get("tags", []))
-    summary = (
-        f"Проверьте рецепт:\n\n"
-        f"Название: {data.get('name')}\n"
-        f"Описание: {data.get('description')}\n"
-        f"Время: {data.get('cooking_time')} мин\n"
-        f"Ингредиенты:\n{ing_text or '-'}\n"
-        f"Теги (id): {tags_text}\n"
-        f"Фото: {'есть' if data.get('image_file_id') else 'нет'}\n"
-        f"Ссылка: {data.get('source_url') or '-'}\n\n"
-        "Нажмите Подтвердить чтобы отправить рецепт на сайт, либо Отмена."
-    )
-    kb = [
-        [InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_send")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        rows.append(nav)
+    rows += [
+        [Button("✅ Готово — к фото", callback_data="tags_done")],
+        [Button("Пропустить", callback_data="skip_tags")],
     ]
-    await (update.callback_query.message if update.callback_query else update.effective_message).reply_text(
-        summary, reply_markup=InlineKeyboardMarkup(kb)
+    await say(update, "Выберите теги. Выбрано: " + (", ".join(chosen.values()) or "нет"), rows)
+    return TAGS
+
+
+async def tag_page_handler(update, context):
+    await answer(update)
+    return await show_tags(update, context, int(update.callback_query.data.split(":")[1]))
+
+
+async def tag_select_handler(update, context):
+    await answer(update)
+    tag_id = int(update.callback_query.data.split(":")[1])
+    chosen = context.user_data.setdefault("selected_tags", {})
+    options = context.user_data.get("tag_options", {})
+    if tag_id in chosen:
+        del chosen[tag_id]
+    elif tag_id in options:
+        chosen[tag_id] = options[tag_id]
+    return await show_tags(update, context, context.user_data.get("tag_page", 1))
+
+
+async def tags_done_handler(update, context):
+    await answer(update)
+    if not context.user_data.get("selected_tags"):
+        # Site validation requires a tag. Skipping uses the first existing tag.
+        if update.callback_query.data == "skip_tags":
+            status, data = await catalog("tags/", 1)
+            if status == 200 and data["results"]:
+                tag = data["results"][0]
+                context.user_data["selected_tags"] = {tag["id"]: tag["name"]}
+                await say(update, f"Выбран тег по умолчанию: {tag['name']}.")
+            else:
+                await say(
+                    update,
+                    "Сайт требует хотя бы один тег. Добавьте тег на сайте и нажмите «Повторить».",
+                    [[Button("Повторить", callback_data="tag_page:1")]],
+                )
+                return TAGS
+        else:
+            await say(update, "Выберите хотя бы один тег или нажмите «Пропустить».")
+            return TAGS
+    await say(
+        update,
+        "Пришлите фото рецепта или нажмите «Пропустить».",
+        [[Button("Пропустить", callback_data="skip_image")]],
     )
-    return CONFIRM_STEP
+    return IMAGE
 
 
-# FINAL: send to site
-async def confirm_send_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    token = load_token_local(q.from_user.id)
-    if not token:
-        await q.message.reply_text("Вы не вошли в систему. Для создания рецепта под аккаунтом нужно войти (команда /start → Войти). Вы можете зарегистрироваться.")
-        return ConversationHandler.END
-
-    data = context.user_data
-    # image
-    if data.get("image_file_id"):
-        image_datauri = await download_photo_as_datauri(data["image_file_id"], context)
-    else:
-        image_datauri = PLACEHOLDER_PNG_DATAURI
-
-    # combine description + source
-    text = data.get("description", "")
-    if data.get("source_url"):
-        text = text + "\n\nСсылка на источник: " + data["source_url"]
-
-    payload = {
-        "name": data.get("name"),
-        "text": text,
-        "cooking_time": int(data.get("cooking_time")),
-        "ingredients": [{"id": i["id"], "amount": i["amount"]} for i in data.get("ingredients", [])],
-        "tags": data.get("tags", []),
-        "image": image_datauri,
-    }
-    # POST /api/recipes/
-    status, resp = await api_post("recipes/", json_data=payload, token=token)
-    if status in (200, 201) and isinstance(resp, dict):
-        await q.message.reply_text("Рецепт успешно создан на сайте ✅")
-        return ConversationHandler.END
-    # validation errors
-    await q.message.reply_text("Ошибка при создании на сайте: " + format_api_errors(resp))
-    return ConversationHandler.END
-
-
-# cancel handler (shared)
-async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def image_handler(update, context):
+    await answer(update)
     if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.message.reply_text("Операция отменена.")
+        context.user_data.pop("image_file_id", None)
+    elif update.effective_message.photo:
+        context.user_data["image_file_id"] = update.effective_message.photo[-1].file_id
     else:
-        await update.effective_message.reply_text("Операция отменена.")
-    return ConversationHandler.END
+        await say(
+            update,
+            "Пришлите фото или нажмите «Пропустить».",
+            [[Button("Пропустить", callback_data="skip_image")]],
+        )
+        return IMAGE
+    await say(
+        update,
+        "Добавьте ссылку на источник или нажмите «Пропустить».",
+        [[Button("Пропустить", callback_data="skip_url")]],
+    )
+    return URL
 
 
-# --------------------------
-# Регистрация хендлеров и запуск бота
-# --------------------------
+async def url_handler(update, context):
+    await answer(update)
+    value = None if update.callback_query else update.effective_message.text.strip()
+    if value and (
+        len(value) > 1000
+        or urlparse(value).scheme not in ("http", "https")
+        or not urlparse(value).netloc
+    ):
+        await say(
+            update,
+            "Введите ссылку http:// или https:// (до 1000 символов).",
+            [[Button("Пропустить", callback_data="skip_url")]],
+        )
+        return URL
+    context.user_data["source_url"] = value
+    data = context.user_data
+    ingredients = "\n".join(
+        f"• {i['name']}: {i['amount']} {i['measurement_unit']}" for i in data["ingredients"]
+    )
+    summary = (
+        f"Проверьте рецепт:\n\n{data['name']}\n{data['description']}\n"
+        f"⏱ {data['cooking_time']} мин.\n{ingredients}\n"
+        f"Теги: {', '.join(data['selected_tags'].values())}\n"
+        f"Фото: {'есть' if data.get('image_file_id') else 'заглушка'}\nСсылка: {value or '—'}"
+    )
+    await send_long(
+        update.effective_message,
+        summary,
+        keyboard([[Button("✅ Подтвердить", callback_data="confirm_send")]]),
+    )
+    return CONFIRM
+
+
+async def download_photo_as_datauri(file_id, context):
+    photo = await context.bot.get_file(file_id)
+    data = await photo.download_as_bytearray()
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+
+
+async def confirm_send_handler(update, context):
+    await answer(update)
+    token = load_token_local(update.effective_user.id)
+    if not token:
+        await say(update, "Для сохранения войдите в аккаунт: /start → Войти.", cancel=False)
+        context.user_data.clear()
+        return END
+    data = context.user_data
+    image = PLACEHOLDER_PNG_DATAURI
+    if data.get("image_file_id"):
+        try:
+            image = await download_photo_as_datauri(data["image_file_id"], context)
+        except Exception:
+            await say(
+                update,
+                "Не удалось загрузить фото. Нажмите «Подтвердить» для повторной попытки.",
+                [[Button("Повторить", callback_data="confirm_send")]],
+            )
+            return CONFIRM
+    text = data["description"]
+    if data.get("source_url"):
+        text += "\n\nСсылка на источник: " + data["source_url"]
+    payload = {
+        "name": data["name"],
+        "text": text,
+        "cooking_time": data["cooking_time"],
+        "ingredients": [{"id": i["id"], "amount": i["amount"]} for i in data["ingredients"]],
+        "tags": list(data["selected_tags"]),
+        "image": image,
+    }
+    status, response = await api_post("recipes/", payload, token=token)
+    if status in (200, 201) and isinstance(response, dict):
+        context.user_data.clear()
+        await say(update, "Рецепт создан ✅", cancel=False)
+        return await menu(update, context)
+    if status == 401:
+        del_token_local(update.effective_user.id)
+    await say(
+        update,
+        "Не удалось сохранить: "
+        + format_api_errors(response)
+        + "\nЧерновик сохранён до отмены. При обрыве связи проверьте список рецептов перед повтором.",
+        [[Button("Повторить", callback_data="confirm_send")]],
+    )
+    return CONFIRM
+
+
+async def view_list(update, context):
+    await answer(update)
+    _, kind, page_text = update.callback_query.data.split(":")
+    page = int(page_text)
+    token = load_token_local(update.effective_user.id)
+    if kind != "all" and not token:
+        await say(update, "Для избранного и корзины войдите в аккаунт через /start.", cancel=False)
+        return END
+    params = {"page": page, "limit": API_PAGE_SIZE}
+    if kind != "all":
+        params["is_favorited" if kind == "fav" else "is_in_shopping_cart"] = 1
+    status, data = await api_get("recipes/", params, token=token)
+    if status != 200:
+        await say(update, "Ошибка получения списка: " + format_api_errors(data), cancel=False)
+        return END
+    results = data.get("results", []) if isinstance(data, dict) else data
+    for recipe in results:
+        rid = recipe["id"]
+        rows = [[Button("Подробнее", callback_data=f"detail:{rid}")]]
+        if token:
+            rows.append(
+                [
+                    Button(
+                        "Убрать ⭐" if recipe.get("is_favorited") else "В избранное ⭐",
+                        callback_data=f"favorite:{'del' if recipe.get('is_favorited') else 'add'}:{rid}",
+                    ),
+                    Button(
+                        "Убрать 🛒" if recipe.get("is_in_shopping_cart") else "В корзину 🛒",
+                        callback_data=f"cart:{'del' if recipe.get('is_in_shopping_cart') else 'add'}:{rid}",
+                    ),
+                ]
+            )
+        await say(update, f"{recipe['name']} — {recipe['cooking_time']} мин.", rows, cancel=False)
+    rows = []
+    if isinstance(data, dict):
+        if data.get("previous"):
+            rows.append(Button("‹ Назад", callback_data=f"list:{kind}:{page - 1}"))
+        if data.get("next"):
+            rows.append(Button("Далее ›", callback_data=f"list:{kind}:{page + 1}"))
+    await say(
+        update,
+        f"Страница {page}." if results else "Рецептов пока нет.",
+        ([rows] if rows else []) + [[Button("🏠 Меню", callback_data="home")]],
+        cancel=False,
+    )
+    return END
+
+
+async def recipe_detail(update, context):
+    await answer(update)
+    rid = int(update.callback_query.data.split(":")[1])
+    status, data = await api_get(
+        f"recipes/{rid}/", token=load_token_local(update.effective_user.id)
+    )
+    if status != 200:
+        await say(update, "Рецепт недоступен: " + format_api_errors(data), cancel=False)
+        return END
+    ingredients = "\n".join(
+        f"• {i['name']}: {i['amount']} {i['measurement_unit']}" for i in data["ingredients"]
+    )
+    text = f"{data['name']}\n\n{data['text']}\n\n⏱ {data['cooking_time']} мин.\n{ingredients}"
+    await send_long(
+        update.effective_message,
+        text,
+        keyboard([[Button("🏠 Меню", callback_data="home")]], cancel=False),
+    )
+    if data.get("image"):
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+                async with session.get(urljoin(SITE_API_BASE + "/", data["image"])) as response:
+                    response.raise_for_status()
+                    content = bytearray()
+                    async for chunk in response.content.iter_chunked(65536):
+                        content.extend(chunk)
+                        if len(content) > 10 * 1024 * 1024:
+                            raise ValueError("Photo exceeds Telegram size limit")
+            await update.effective_message.reply_photo(io.BytesIO(content))
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            await say(update, "Фото временно недоступно.", cancel=False)
+    return END
+
+
+async def recipe_action(update, context):
+    await answer(update)
+    kind, action, rid = update.callback_query.data.split(":")
+    token = load_token_local(update.effective_user.id)
+    if not token:
+        await say(update, "Сначала войдите через /start.", cancel=False)
+        return END
+    endpoint = "favorite" if kind == "favorite" else "shopping_cart"
+    status, data = await api_request(
+        "POST" if action == "add" else "DELETE", f"recipes/{int(rid)}/{endpoint}/", token=token
+    )
+    await say(
+        update,
+        ("Добавлено." if action == "add" else "Удалено.")
+        if status in (200, 201, 204)
+        else "Ошибка: " + format_api_errors(data),
+        cancel=False,
+    )
+    if status in (200, 201, 204):
+        await update.callback_query.edit_message_reply_markup(
+            reply_markup=keyboard(
+                [
+                    [
+                        Button("Открыть избранное", callback_data="list:fav:1"),
+                        Button("Открыть корзину", callback_data="list:cart:1"),
+                    ],
+                    [Button("Подробнее", callback_data=f"detail:{int(rid)}")],
+                ],
+                cancel=False,
+            )
+        )
+    return END
+
+
+async def shopping_list(update, context):
+    await answer(update)
+    token = load_token_local(update.effective_user.id)
+    if not token:
+        await say(update, "Сначала войдите через /start.", cancel=False)
+        return END
+    # Aggregate cart ingredients here; the legacy site's download endpoint groups
+    # by recipe ingredient rows and does not combine repeated ingredients.
+    totals = {}
+    page = 1
+    while True:
+        status, data = await api_get(
+            "recipes/", {"is_in_shopping_cart": 1, "page": page, "limit": 100}, token=token
+        )
+        if status != 200:
+            await say(update, "Ошибка: " + format_api_errors(data), cancel=False)
+            return END
+        recipes = data.get("results", []) if isinstance(data, dict) else data
+        for recipe in recipes:
+            for ingredient in recipe.get("ingredients", []):
+                key = (ingredient["name"], ingredient["measurement_unit"])
+                totals[key] = totals.get(key, 0) + ingredient["amount"]
+        if not isinstance(data, dict) or not data.get("next"):
+            break
+        page += 1
+    text = "\n".join(
+        f"{name} ({unit}) — {amount}" for (name, unit), amount in sorted(totals.items())
+    )
+    await send_long(update.effective_message, text or "Корзина пуста.")
+    return END
+
+
+async def cancel_handler(update, context):
+    await answer(update)
+    context.user_data.clear()
+    await say(update, "Операция отменена.", cancel=False)
+    return await menu(update, context)
+
+
+async def stale_callback(update, context):
+    await answer(update)
+    await say(
+        update, "Эта кнопка больше не активна. Используйте кнопки последнего шага или /cancel."
+    )
+    return None
+
+
+async def error_handler(update, context):
+    # Logging Update or exception text can expose passwords, tokens and API URLs.
+    LOGGER.error("Update failed (%s)", type(context.error).__name__)
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(
+            "Не удалось выполнить действие. Повторите его или используйте /cancel."
+        )
+
+
 def build_conv_handler():
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(start_add_recipe, pattern="^add_recipe$"),
-                      CommandHandler("add", start_add_recipe),
-                      ],
+    text = filters.TEXT & ~filters.COMMAND
+    ingredient_choices = [
+        CallbackQueryHandler(ing_letter_handler, pattern=r"^ing_letter:[A-ZА-ЯЁ]$"),
+        CallbackQueryHandler(ing_page_handler, pattern=r"^ing_page:[1-9][0-9]*$"),
+        CallbackQueryHandler(ing_select_handler, pattern=r"^ing_select:[1-9][0-9]*$"),
+        CallbackQueryHandler(ing_confirm_choose_handler, pattern=r"^(ing_back_letters|ing_done)$"),
+        MessageHandler(text, ing_letter_handler),
+    ]
+    return ConversationHandler(
+        entry_points=[
+            CommandHandler(["start", "menu"], menu),
+            CommandHandler(["add", "addrecipe"], start_add_recipe),
+            CallbackQueryHandler(menu, pattern=r"^home$"),
+            CallbackQueryHandler(start_add_recipe, pattern=r"^add_recipe$"),
+            CallbackQueryHandler(auth_choice_handler, pattern=r"^auth:(login|register)$"),
+            CallbackQueryHandler(logout, pattern=r"^logout$"),
+            CallbackQueryHandler(view_list, pattern=r"^list:(all|fav|cart):[1-9][0-9]*$"),
+            CallbackQueryHandler(recipe_detail, pattern=r"^detail:[1-9][0-9]*$"),
+            CallbackQueryHandler(recipe_action, pattern=r"^(favorite|cart):(add|del):[1-9][0-9]*$"),
+            CallbackQueryHandler(shopping_list, pattern=r"^shopping_list$"),
+        ],
         states={
-            RECIPE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, recipe_name)],
-            RECIPE_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, recipe_desc)],
-            COOK_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, recipe_cook_time)],
-            ING_LETTER: [CallbackQueryHandler(ing_letter_handler, pattern="^ing_letter:")],
-            ING_PAGE: [CallbackQueryHandler(ing_page_handler, pattern="^ing_page:" )],
-            ING_SELECT: [CallbackQueryHandler(ing_select_handler, pattern="^ing_select:")],
-            ING_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ing_qty_handler)],
-            ING_CONFIRM_CHOOSE: [CallbackQueryHandler(ing_confirm_choose_handler, pattern="^(ing_back_letters|ing_done)$")],
-            TAGS_CHOOSE: [
-                CallbackQueryHandler(tag_page_handler, pattern="^tag_page:"),
-                CallbackQueryHandler(tag_select_handler, pattern="^tag_select:"),
-                CallbackQueryHandler(tags_done_handler, pattern="^tags_done$"),
+            LOGIN_EMAIL: [MessageHandler(text, auth_login_email)],
+            LOGIN_PASS: [MessageHandler(text, auth_login_pass)],
+            REG_EMAIL: [MessageHandler(text, auth_register_email)],
+            REG_USERNAME: [MessageHandler(text, auth_register_username)],
+            REG_FIRST: [MessageHandler(text, auth_register_first)],
+            REG_LAST: [MessageHandler(text, auth_register_last)],
+            REG_PASS: [MessageHandler(text, auth_register_pass)],
+            NAME: [MessageHandler(text, recipe_name)],
+            DESCRIPTION: [MessageHandler(text, recipe_desc)],
+            COOK_TIME: [MessageHandler(text, recipe_cook_time)],
+            ING_LETTER: ingredient_choices,
+            ING_PAGE: ingredient_choices,
+            ING_MORE: ingredient_choices,
+            ING_QTY: [MessageHandler(text, ing_qty_handler)],
+            TAGS: [
+                CallbackQueryHandler(tag_page_handler, pattern=r"^tag_page:[1-9][0-9]*$"),
+                CallbackQueryHandler(tag_select_handler, pattern=r"^tag_select:[1-9][0-9]*$"),
+                CallbackQueryHandler(tags_done_handler, pattern=r"^(tags_done|skip_tags)$"),
             ],
-            IMAGE_STEP: [
-                MessageHandler(filters.PHOTO, image_handler),
-                CallbackQueryHandler(image_handler, pattern="^skip_image$"),
+            IMAGE: [
+                MessageHandler(filters.ALL & ~filters.COMMAND, image_handler),
+                CallbackQueryHandler(image_handler, pattern=r"^skip_image$"),
             ],
-            URL_STEP: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, url_handler),
-                CallbackQueryHandler(url_handler, pattern="^skip_url$"),
+            URL: [
+                MessageHandler(text, url_handler),
+                CallbackQueryHandler(url_handler, pattern=r"^skip_url$"),
             ],
-            CONFIRM_STEP: [CallbackQueryHandler(confirm_send_handler, pattern="^confirm_send$"),
-                           CallbackQueryHandler(cancel_handler, pattern="^cancel$")],
+            CONFIRM: [CallbackQueryHandler(confirm_send_handler, pattern=r"^confirm_send$")],
         },
-        fallbacks=[CallbackQueryHandler(cancel_handler, pattern="^cancel$"), CommandHandler("cancel", cancel_handler)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_handler),
+            CommandHandler(["start", "menu"], menu),
+            CallbackQueryHandler(cancel_handler, pattern=r"^cancel$"),
+            CallbackQueryHandler(stale_callback),
+        ],
         per_user=True,
         per_chat=True,
+        allow_reentry=False,
     )
-    return conv
 
 
-def build_auth_conv():
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start_handler), CallbackQueryHandler(auth_choice_handler, pattern="^auth:")],
-        states={
-            AUTH_CHOICE: [CallbackQueryHandler(auth_choice_handler, pattern="^auth:")],
-            AUTH_LOGIN_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_login_email)],
-            AUTH_LOGIN_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_login_pass)],
-            AUTH_REGISTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_register_email)],
-            AUTH_REGISTER_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_register_username)],
-            AUTH_REGISTER_FIRST: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_register_first)],
-            AUTH_REGISTER_LAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_register_last)],
-            AUTH_REGISTER_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_register_pass)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_handler)],
-        per_user=True,
-        per_chat=True,
+async def on_start(application):
+    await application.bot.set_my_commands(
+        [
+            ("start", "Открыть меню"),
+            ("addrecipe", "Создать рецепт"),
+            ("cancel", "Отменить действие"),
+        ]
     )
-    return conv
+    LOGGER.warning("Bot ready: @%s", application.bot.username)
+
+
+def build_application():
+    validate_config()
+    application = (
+        ApplicationBuilder().token(TOKEN).concurrent_updates(False).post_init(on_start).build()
+    )
+    application.add_handler(TypeHandler(Update, private_only), group=-1)
+    application.add_handler(build_conv_handler())
+    application.add_handler(CommandHandler("cancel", cancel_handler))
+    application.add_handler(CallbackQueryHandler(stale_callback))
+    application.add_error_handler(error_handler)
+    return application
 
 
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-    # auth/start conversation
-    auth_conv = build_auth_conv()
-    add_conv = build_conv_handler()
-
-    app.add_handler(auth_conv)
-    app.add_handler(add_conv)
-    # Menu and list handlers - simple
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CallbackQueryHandler(start_handler, pattern="^start$"))
-    # View list (recipes)
-    async def view_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        q = update.callback_query
-        await q.answer()
-        status, data = await api_get("recipes/", params={"page": 1})
-        if status != 200:
-            await q.message.reply_text("Ошибка получения списка: " + format_api_errors(data))
-            return
-        results = data.get("results", data) if isinstance(data, dict) else data
-        if not results:
-            await q.message.reply_text("Рецептов пока нет.")
-            return
-        for r in results:
-            await q.message.reply_text(f"{r.get('id')}: {r.get('name')} — {r.get('cooking_time')} мин")
-    app.add_handler(CallbackQueryHandler(view_list_cb, pattern="^view_list$"))
-
-    # Shortcut to start add recipe from menu: we'll add a simple command
-    app.add_handler(CommandHandler("addrecipe", start_add_recipe))
-
-    print("Bot started")
-    app.run_polling()
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    build_application().run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
