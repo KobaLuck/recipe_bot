@@ -1,4 +1,6 @@
-# Recipes Book Bot
+# Recipe Bot · Telegram-клиент Recipes
+
+**Python · python-telegram-bot · aiohttp · Docker**
 
 Telegram-бот для сайта [KobaLuck/Recipes](https://github.com/KobaLuck/Recipes):
 просмотр рецептов без входа, регистрация и вход, создание рецептов,
