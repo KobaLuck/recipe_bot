@@ -1,25 +1,19 @@
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 
 class Config:
-    # Абсолютный путь к папке проекта
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    # Путь к файлу БД
-    DB_FILE = os.path.join(BASE_DIR, 'instance', 'recipes_bot.db')
-    SQLALCHEMY_DATABASE_URI = f"sqlite:///{DB_FILE}"
-
+    DB_FILE = BASE_DIR / "instance" / "recipes_bot.db"
+    SQLALCHEMY_DATABASE_URI = os.getenv("DATABASE_URL", f"sqlite:///{DB_FILE}")
     SQLALCHEMY_TRACK_MODIFICATIONS = False
-    SECRET_KEY = os.getenv('SECRET_KEY', 'change_me_in_prod')
-    ADMIN_IDS = [
-        int(i) for i in os.getenv('ADMIN_IDS', '514543014').split(',')
-        if i.strip().isdigit()
-    ]
-    TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-    
-    # Дополнительные настройки
-    DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
-    HOST = os.getenv('HOST', '0.0.0.0')
-    PORT = int(os.getenv('PORT', 5000))
+    SECRET_KEY = os.getenv("SECRET_KEY") or os.urandom(32)
+    ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "")
+    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+    DEBUG = os.getenv("DEBUG", "False").lower() == "true"
+    HOST = os.getenv("HOST", "127.0.0.1")
+    PORT = int(os.getenv("PORT") or "5000")

@@ -1,0 +1,8 @@
+# Compatibility environment for the existing Recipes backend, not runtime dependencies.
+-r requirements-dev.txt
+Django==3.2.25
+djangorestframework==3.12.4
+djoser==2.1.0
+Pillow>=10,<12
+django-filter==2.4.0
+psycopg2-binary>=2.9,<3
